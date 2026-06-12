@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cbpi4-CustomPIDHerms"
-version = "0.0.2"
+version = "0.0.0"
 description = "Custom PID HERMS Kettle Logic plugin with Delta tracking for CBPi4 on Python 3.13"
 readme = "README.md"
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "BlueMBrewing", email = "your.email@example.com" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
