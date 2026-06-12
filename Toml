@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cbpi4-CustomPIDHerms"
+version = "0.0.2"
+description = "Custom PID HERMS Kettle Logic plugin with Delta tracking for CBPi4 on Python 3.13"
+readme = "README.md"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    # Add any external pip packages your plugin imports here, if any
+]
+
+[project.entry-points."cbpi4.plugins"]
+CustomPIDHermsController = "cbpi4-CustomPIDHerms:CustomPIDHermsController"
+
