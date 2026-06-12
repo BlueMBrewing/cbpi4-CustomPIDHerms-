@@ -1,105 +1,257 @@
+import asyncio
+from asyncio import tasks
 import logging
-from cbpi.api import KettleController, Property, cbpi
+from cbpi.api import *
+import time
+import datetime
 
-logger = logging.getLogger(__name__)
+@parameters([Property.Sensor(label = "HLT_Sensor",
+                             description="Sensor of HLT Kettle"),
+             Property.Number(label="DeltaTemp", configurable=True, 
+                             description="Max Delta HLT Temp above Mash Target Temp (Heater/PID will switch off if delta between HLT and Mash is larger)"),
+             Property.Number(label="P", configurable=True, default_value=117.0795, 
+                             description="P Value of PID"),
+             Property.Number(label="I", configurable=True, default_value=0.2747, 
+                             description="I Value of PID"),
+             Property.Number(label="D", configurable=True, default_value=41.58, 
+                             description="D Value of PID"),
+             Property.Select(label="SampleTime", options=[2,5], 
+                             description="PID Sample time in seconds. Default: 5 (How often is the output calculation done)"),
+             Property.Number(label="Max_Pump_Temp", configurable=True, default_value=88,
+                             description="Max temp the pump can work in."),
+             Property.Number(label = "Max_Output", configurable = True, default_value = 100, 
+                             description="Max power for PID and Ramp up."),
+             Property.Number(label="Max_Boil_Output", configurable=True, default_value=85,
+                             description="Power when Max Boil Temperature is reached."),
+             Property.Number(label="Max_Boil_Temp", configurable=True, default_value=98,
+                             description="When Temperature reaches this, power will be reduced to Max Boil Output."),
+             Property.Number(label="Max_PID_Temp", configurable=True,
+                             description="When this temperature is reached, PID will be turned off"),
+             Property.Number(label="Rest_Interval", configurable=True, default_value=600,
+                             description="Rest the pump after this many seconds during the mash."),
+             Property.Number(label="Rest_Time", configurable=True, default_value=60,
+                             description="Rest the pump for this many seconds every rest interval.")])
 
-@cbpi.controller
-class CustomPIDHermsController(KettleController):
-  
-  # --- Standard PID Properties ---
-  p_gain = Property.Number("P-Gain", configurable=True, default_value=10.0, description="Proportional gain")
-  i_gain = Property.Number("I-Gain", configurable=True, default_value=0.1, description="Integral gain")
-  d_gain = Property.Number("D-Gain", configurable=True, default_value=1.0, description="Derivative gain")
-  
-  max_output = Property.Number("Max PID Power (%)", configurable=True, default_value=100, description="Maximum power allowed for PID control")
-  max_boil_temp = Property.Number("Boil Temp Threshold", configurable=True, default_value=98.0, description="Temperature above which PID is ignored and constant power is applied")
-  max_boil_output = Property.Number("Max Boil Power (%)", configurable=True, default_value=80, description="Constant power percentage used during boiling")
-  
-  # --- Dual Sensor & Delta Protection Properties ---
-  # Note: The standard "Kettle Sensor" in CBPi will act as your Mash Sensor (driving the target temperature)
-  hlt_sensor = Property.Sensor("HLT Sensor", description="Select the sensor monitoring your Hot Liquor Tank (HLT)")
-  max_delta = Property.Number("Max Delta Temp", configurable=True, default_value=5.0, description="Max allowed temp difference between HLT and Mash before shutting down power")
+class PID_HERMS2(CBPiKettleLogic):
 
-  def __init__(self, cbpi, id, props):
-    super(CustomPIDHermsController, self).__init__(cbpi, id, props)
-    self.integral = 0.0
-    self.last_error = 0.0
-    self.delta_interrupted = False # Track if we are currently in a safety lockout
+    def __init__(self, cbpi, id, props):
+        super().__init__(cbpi, id, props)
+        self._logger = logging.getLogger(type(self).__name__)
+        self.sample_time, self.max_output, self.pid = None, None, None
+        self.work_time, self.rest_time, self.max_output_boil = None, None, None
+        self.max_boil_temp, self.max_pid_temp, self.max_pump_temp = None, None, None
+        self.kettle, self.heater, self.agitator = None, None, None
+
+    async def on_stop(self):
+        await self.actor_off(self.agitator)
     
-  async def run(self):
-    """
-    Main logic loop executing dual-sensor monitoring and Delta safety checks.
-    """
-    while self.is_running():
-      try:
-        # 1. Fetch current target and Mash temperature (from the primary Kettle sensor)
-        target_temp = float(self.get_target_temp())
-        mash_temp = float(self.get_current_temp())
-        # 2. Fetch the secondary HLT sensor temperature
-        hlt_temp_str = self.cbpi.cache.get("sensor").get(self.hlt_sensor).value
-        if hlt_temp_str is None:
-          logger.warning("[CustomPIDHerms] HLT Sensor reading is unavailable. Skipping cycle for safety.")
-          await self.set_power(0.0)
-          await cbpi.sleep(2)
-          continue
-          
-        hlt_temp = float(hlt_temp_str)
-        current_delta = hlt_temp - mash_temp
-        max_allowed_delta = float(self.max_delta)
-        # 3. Delta Safety Check Logic
-        if current_delta > max_allowed_delta:
-          if not self.delta_interrupted:
-            logger.warning(
-              f"[CustomPIDHerms] SAFETY ALERT: HLT ({hlt_temp:.2f}°C) exceeds Mash ({mash_temp:.2f}°C) "
-              f"by {current_delta:.2f}°C (Max Delta: {max_allowed_delta}°C). Shutting down heating element."
-            )
-            self.delta_interrupted = True
+    # subroutine that controlls pump aue and ump stop if max pump temp is reached
+    async def pump_control(self):
+        #get pump based on agitator id
+        self.pump = self.cbpi.actor.find_by_id(self.agitator)
+
+        while self.running:
+            # get current pump status
+            if self.pump.instance:
+                pump_on = self.pump.instance.state
+            else:
+                pump_on = False
+            # if the current temp is below the max pump temp, check if pause time is reached to pause pump
+            if self.get_sensor_value(self.kettle.sensor).get("value") < self.max_pump_temp:
+                self._logger.debug("starting pump")
+                #switch the pump on
+                await self.actor_on(self.agitator)
+                # calculate time, when pump should do the next pause
+                off_time = time.time() + self.work_time
+                # run pump until next pause time is reached
+                while time.time() < off_time:
+                    await asyncio.sleep(1)
+                    # stop cycle, if current temp is higher than max pump temp
+                    if self.get_sensor_value(self.kettle.sensor).get("value") >= self.max_pump_temp:
+                        break
+                # pause pump when active pump Interval is completed
+                self._logger.debug("resting pump")
+                await self.actor_off(self.agitator)
+                await asyncio.sleep(self.rest_time)
+            # If temeprature is above max pump temp, and pump is on, switch it off
+            # Staops also the pump if user switches it on and temp is abouve max pump temp
+            else:
+                if pump_on:
+                    self._logger.debug("pump max temp reached, pump turned off")
+                    await self.actor_off(self.agitator)
+                await asyncio.sleep(1)
+
+    # subroutine that controlls temperature via pid controll
+    async def temp_control(self):
+        await self.actor_on(self.heater,0)
+        heat_percent_old = 0
+
+        while self.running:
+            try:
+                self.HLT_Temp = self.get_sensor_value(self.sensor).get("value")
+            except:
+                self.HLT_Temp = None
+
+            # get current temeprature
+            sensor_value = current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
+            # get the current target temperature for the kettle
+            target_temp = self.get_kettle_target_temp(self.id)
+
+            if self.HLT_Temp is not None:
+                delta_temp = self.HLT_Temp - target_temp
+                if (delta_temp > self.delta):
+                    self.PIDActive = False
+                else:
+                    self.PIDActive = True
+
+            # if current temperature is higher the defined boil temp, use fixed heating percent instead of PID values for controlled boiling
+            if current_temp >= self.max_boil_temp:
+                heat_percent = self.max_output_boil
+            # if current temperature is above max pid temp (should be higher than mashout temp and lower then max boil temp) 100% output will be used untile boil temp is reached
+            elif current_temp >= self.max_pid_temp:
+                heat_percent = self.max_output
+            # at lower temepratures, PID algorythm will valculate heat percent value
+            else:
+                if self.PIDActive == True:
+                    heat_percent = self.pid.calc(sensor_value, target_temp)
+                else:
+                    heat_percent = 0
+
+            # Test with actor power
+            if heat_percent != heat_percent_old:
+                await self.actor_set_power(self.heater,heat_percent)
+                heat_percent_old = heat_percent
+            await asyncio.sleep(self.sample_time)
+
+
+    async def run(self):
+        self._logger = logging.getLogger(type(self).__name__)
+        try:
+            self.sample_time = int(self.props.get("SampleTime",5))
+            self.max_output = int(self.props.get("Max_Output",100))
+            p = float(self.props.get("P", 117.0795))
+            i = float(self.props.get("I", 0.2747))
+            d = float(self.props.get("D", 41.58))
+            self.pid = PIDArduino(self.sample_time, p, i, d, 0, self.max_output)
+            self.PIDActive = True
+
+            self.work_time = float(self.props.get("Rest_Interval", 600))
+            self.rest_time = float(self.props.get("Rest_Time", 60))
+            self.max_output_boil = float(self.props.get("Max_Boil_Output", 85))
             
-          # Force heating element off
-          await self.set_power(0.0)
-          # Pause the PID integral tracking while interrupted so it doesn't wind up heavily
-          await cbpi.sleep(2)
-          continue
+            self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
+            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
+            maxpidtemp = 88 if self.TEMP_UNIT == "C" else 190
+            maxpumptemp = 88 if self.TEMP_UNIT == "C" else 190
 
-        # If it was interrupted but has now dropped back into the safe zone
-        if self.delta_interrupted and current_delta <= max_allowed_delta:
-          logger.info(f"[CustomPIDHerms] Delta recovered ({current_delta:.2f}°C). Resuming PID logic.")
-          self.delta_interrupted = False
-          
-        # 4. Boil Threshold Check
-        if mash_temp >= float(self.max_boil_temp):
-          logger.info(f"[CustomPIDHerms] Target reached Boil threshold. Setting flat power.")
-          await self.set_power(float(self.max_boil_output))
-          
-        # 5. Standard PID Math (driven by the Mash temperature)
+
+            self.max_boil_temp = float(self.props.get("Max_Boil_Temp", boilthreshold))
+            self.max_pid_temp = float(self.props.get("Max_PID_Temp", maxpidtemp))
+            self.max_pump_temp = float(self.props.get("Max_Pump_Temp", maxpumptemp))
+
+            self.kettle = self.get_kettle(self.id)
+            self.heater = self.kettle.heater
+            self.agitator = self.kettle.agitator
+            self.sensor = self.props.get("HLT_Sensor", None)
+            self.delta = float(self.props.get("DeltaTemp",0))
+
+            logging.info("CustomLogic P:{} I:{} D:{} {} {}".format(p, i, d, self.kettle, self.heater))
+
+            pump_controller = asyncio.create_task(self.pump_control())
+            temp_controller = asyncio.create_task(self.temp_control())
+
+            await pump_controller
+            await temp_controller
+
+        except asyncio.CancelledError as e:
+            pass
+        except Exception as e:
+            logging.error("PIDHerms Error {}".format(e))
+        finally:
+            self.running = False
+            await self.actor_off(self.heater)
+
+# Based on Arduino PID Library
+# See https://github.com/br3ttb/Arduino-PID-Library
+class PIDArduino(object):
+
+    def __init__(self, sampleTimeSec, kp, ki, kd, outputMin=float('-inf'),
+                 outputMax=float('inf'), getTimeMs=None):
+        if kp is None:
+            raise ValueError('kp must be specified')
+        if ki is None:
+            raise ValueError('ki must be specified')
+        if kd is None:
+            raise ValueError('kd must be specified')
+        if float(sampleTimeSec) <= float(0):
+            raise ValueError('sampleTimeSec must be greater than 0')
+        if outputMin >= outputMax:
+            raise ValueError('outputMin must be less than outputMax')
+
+        self._logger = logging.getLogger(type(self).__name__)
+        self._Kp = kp
+        self._Ki = ki * sampleTimeSec
+        self._Kd = kd / sampleTimeSec
+        self._sampleTime = sampleTimeSec * 1000
+        self._outputMin = outputMin
+        self._outputMax = outputMax
+        self._iTerm = 0
+        self._lastInput = 0
+        self._lastOutput = 0
+        self._lastCalc = 0
+
+        if getTimeMs is None:
+            self._getTimeMs = self._currentTimeMs
         else:
-          error = target_temp - mash_temp
-          self.integral += error
-          derivative = error - self.last_error
-          
-          p_out = float(self.p_gain) * error
-          i_out = float(self.i_gain) * self.integral
-          d_out = float(self.d_gain) * derivative
-          
-          output = p_out + i_out + d_out
-          output = max(0.0, min(output, float(self.max_output)))
-          
-          self.last_error = error
-          
-          logger.info(
-              f"[CustomPIDHerms] Mash: {mash_temp:.1f}°C | HLT: {hlt_temp:.1f}°C | "
-              f"Delta: {current_delta:.1f}°C | Output Power: {output:.1f}%"
-          )
-          await self.set_power(output)
-          
-      except Exception as e:
-        logger.error(f"Error in CustomPIDHerms execution: {str(e)}")
-        await self.set_power(0.0) # Safe default on error
+            self._getTimeMs = getTimeMs
 
-      await cbpi.sleep(2)
-  def stop(self):
-    """Cleanup actions when the kettle logic stops."""
-    self.integral = 0.0
-    self.last_error = 0.0
-    self.delta_interrupted = False
-    super(CustomPIDHermsController, self).stop()
+    def calc(self, inputValue, setpoint):
+        now = self._getTimeMs()
+
+        if (now - self._lastCalc) < self._sampleTime:
+            return self._lastOutput
+
+        # Compute all the working error variables
+        error = setpoint - inputValue
+        dInput = inputValue - self._lastInput
+
+        # In order to prevent windup, only integrate if the process is not saturated
+        if self._lastOutput < self._outputMax and self._lastOutput > self._outputMin:
+            self._iTerm += self._Ki * error
+            self._iTerm = min(self._iTerm, self._outputMax)
+            self._iTerm = max(self._iTerm, self._outputMin)
+
+        p = self._Kp * error
+        i = self._iTerm
+        d = -(self._Kd * dInput)
+
+        # Compute PID Output
+        self._lastOutput = p + i + d
+        self._lastOutput = min(self._lastOutput, self._outputMax)
+        self._lastOutput = max(self._lastOutput, self._outputMin)
+
+        # Log some debug info
+        self._logger.debug('P: {0}'.format(p))
+        self._logger.debug('I: {0}'.format(i))
+        self._logger.debug('D: {0}'.format(d))
+        self._logger.debug('output: {0}'.format(self._lastOutput))
+
+        # Remember some variables for next time
+        self._lastInput = inputValue
+        self._lastCalc = now
+        return self._lastOutput
+
+    def _currentTimeMs(self):
+        return time.time() * 1000
+
+def setup(cbpi):
+
+    '''
+    This method is called by the server during startup 
+    Here you need to register your plugins at the server
+    
+    :param cbpi: the cbpi core 
+    :return: 
+    '''
+
+    cbpi.plugin.register("PID_HERMS2", PID_HERMS2)
